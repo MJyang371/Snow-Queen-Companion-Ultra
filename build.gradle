@@ -1,0 +1,206 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    // Pinned (instead of '[6.0,6.2)') so the build resolves deterministically
+    // against the version already present in the local Gradle cache.
+    id 'net.minecraftforge.gradle' version '6.0.54'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+// Forge 1.20.1 runs on Java 17 (the workspace JDK lives in D:/MinecraftModding/.jdks,
+// registered for Gradle through ~/.gradle/gradle.properties).
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+println "Java: ${System.getProperty 'java.version'}, JVM: ${System.getProperty 'java.vm.version'} (${System.getProperty 'java.vendor'}), Arch: ${System.getProperty 'os.arch'}"
+
+minecraft {
+    mappings channel: mapping_channel, version: mapping_version
+
+    // Applies to *Minecraft* classes only. Empty until an addon feature needs it.
+    accessTransformer = file('src/main/resources/META-INF/accesstransformer.cfg')
+
+    copyIdeResources = true
+
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', mod_id
+            args '--nogui'
+        }
+
+        data {
+            workingDirectory project.file('run-data')
+            args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
+        }
+    }
+}
+
+sourceSets.main.resources { srcDir 'src/generated/resources' }
+
+repositories {
+    // Only local files are needed: Twilight Forest is consumed as a drop-in jar.
+    flatDir { dirs 'libs' }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    // ---- The Twilight Forest (the mod we extend) ---------------------------
+    // The published universal jar is reobfuscated to SRG (m_xxxxx_) names while
+    // this workspace compiles against official mappings. fg.deobf() remaps the
+    // jar and puts it on both the compile and the runtime classpath, so
+    // `runClient` boots with Twilight Forest loaded.
+    //
+    // Must use the flatDir ("local:<name>:<version>") form: ForgeGradle cannot
+    // deobfuscate a raw files(...) dependency and silently keeps SRG names.
+    implementation fg.deobf("local:twilightforest:1.20.1-4.3.2508-universal")
+
+    // Mixin annotation processor: turns official-mapping names in @Mixin classes
+    // into the SRG refmap that Forge 1.20.1 needs at runtime. It only runs when
+    // a mapping file is supplied (see the JavaCompile block further down).
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+}
+
+// ---------------------------------------------------------------------------
+// Mixin refmap generation
+// ---------------------------------------------------------------------------
+// The mixin annotation processor wants a TSRG going from the names used in the
+// source (official / Mojang) to the shipped runtime names (SRG, m_xxxxx_).
+// ForgeGradle only emits the reverse file (srg_to_official), so invert it here.
+def officialToSrg = layout.buildDirectory.file("mixin/official_to_srg.tsrg")
+def mixinRefmap = layout.buildDirectory.file("mixin/${mod_id}.refmap.json")
+
+def generateOfficialToSrg = tasks.register('generateOfficialToSrg') {
+    def sourceTree = fileTree("$buildDir/fg_cache/de/oceanlabs/mcp/mcp_config") {
+        include '**/srg_to_official_*.tsrg'
+    }
+    inputs.files(sourceTree).optional()
+    // Resolving the mapped Forge dependency creates the SRG -> official mapping on a fresh checkout.
+    inputs.files(configurations.compileClasspath).withPropertyName('mappedCompileClasspath')
+            .withNormalizer(ClasspathNormalizer)
+    outputs.file(officialToSrg)
+    doLast {
+        def input = sourceTree.files.find { it.exists() }
+        if (input == null) {
+            throw new GradleException('ForgeGradle did not produce the SRG -> official mapping for Mixin')
+        }
+        def outFile = officialToSrg.get().asFile
+        outFile.parentFile.mkdirs()
+        outFile.withWriter('UTF-8') { writer ->
+            input.eachLine('UTF-8') { line ->
+                if (line.startsWith('tsrg2') || line.trim().isEmpty()) {
+                    return
+                }
+                if (line.startsWith('\t\t')) {
+                    // static blocks / parameter names are irrelevant for refmaps
+                    return
+                }
+                if (line.startsWith('\t')) {
+                    def parts = line.substring(1).split(' ')
+                    if (parts.length == 2) {
+                        // field: <srg> <official>  ->  <official> <srg>
+                        writer.writeLine("\t${parts[1]} ${parts[0]}")
+                    } else if (parts.length == 3) {
+                        // method: <srg> <desc> <official>  ->  <official> <desc> <srg>
+                        writer.writeLine("\t${parts[2]} ${parts[1]} ${parts[0]}")
+                    }
+                    return
+                }
+                def parts = line.split(' ')
+                if (parts.length == 2) {
+                    writer.writeLine("${parts[1]} ${parts[0]}")
+                }
+            }
+        }
+        logger.lifecycle("Wrote mixin mapping ${outFile} from ${input}")
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    dependsOn generateOfficialToSrg
+    options.compilerArgs += [
+            "-AoutRefMapFile=${mixinRefmap.get().asFile.absolutePath}",
+            "-AmappingTypes=tsrg",
+            "-AreobfTsrgFile=${officialToSrg.get().asFile.absolutePath}"
+    ]
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            forge_version          : forge_version,
+            forge_version_range    : forge_version_range,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description,
+    ]
+    inputs.properties replaceProperties
+    filteringCharset = 'UTF-8'
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    // The refmap is generated by javac, so it is added here instead of in resources.
+    from(mixinRefmap)
+
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'MixinConfigs'            : "${mod_id}.mixins.json",
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+
+    // Forge 1.20.1 production runtime expects SRG names in the shipped jar.
+    finalizedBy 'reobfJar'
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifact jar
+        }
+    }
+    repositories {
+        maven { url "file://${project.projectDir}/mcmodsrepo" }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
